@@ -239,4 +239,8 @@ class QemuPipe:
             data = b""
 
         ret_value = ((ret & 0xFF) << 24) | len(data)
-        self.s_peer.sendall(struct.pack("<I", ret_value) + data)
+        try:
+            self.s_peer.sendall(struct.pack("<I", ret_value) + data)
+        except BrokenPipeError:
+            # MacOS way of telling us "connection closed"
+            pass
