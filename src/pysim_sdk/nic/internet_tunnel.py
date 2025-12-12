@@ -6,12 +6,11 @@ import threading
 import subprocess
 import random
 
-from scapy.all import Packet, raw, IP, ICMP, Ether, TCP, UDP
+from scapy.all import raw, IP, ICMP, Ether, TCP, UDP, fragment
 from scapy.layers.l2 import ARP
 
 from pysim_sdk.nic.nic import BaseNetworkInterface
 from pysim_sdk.utils import log
-from nodo.routing.core.root import ROOT_MASK, ROOT_NETWORK
 from pysim_sdk.utils.ip_address import str2ip
 
 
@@ -25,14 +24,18 @@ class InternetTunnel(BaseNetworkInterface):
 
     if_type = "inet"
 
-    def __init__(self, events_sink, interface_name, layer_2=False):
+    def __init__(self, events_sink, interface_name, layer_2=False, mtu=1500, nat_network="10.0.0.0", nat_mask="255.0.0.0"):
         self.events_sink = events_sink
         self._if_name = interface_name
         self._quit_signal = False
         self._thread = threading.Thread(target=self._main_thread, name="inet-tunnel")
         self.external_ip = None
         self.nat_table = None
+        self.nat_network = nat_network
+        self.nat_mask = nat_mask
         self.layer_2 = layer_2
+        # Include IP and Ethernet headers 
+        self.fragment_size = (mtu - (14 + 20)) if layer_2 else (mtu - 20)
 
     def _main_thread(self):
         with socket.socket(
@@ -42,7 +45,7 @@ class InternetTunnel(BaseNetworkInterface):
             self.external_ip = get_ip_address(self._if_name)
             self.ip_addr = self.external_ip
             self.mask = "255.255.255.255"
-            self.nat_table = NAT(self.external_ip)
+            self.nat_table = NAT(self.external_ip, self.nat_network, self.nat_mask)
             log.info("[INTERNET TUNNEL] external IP: %r", self.external_ip)
             self._socket = s
             while not self._quit_signal:
@@ -55,16 +58,25 @@ class InternetTunnel(BaseNetworkInterface):
 
                 if IP in packet:
                     if nat_packet := self.nat_table.nat(packet[IP]):
-                        log.info("[INTERNET TUNNEL] DISPATCH: %s", nat_packet)
+                        log.info("[INTERNET TUNNEL] DISPATCH: %s - %r bytes", nat_packet, len(raw(nat_packet)))
                         self.count_packet_in(raw(nat_packet))
-                        if self.layer_2:
-                            self.events_sink.put(
-                                (self, "packet-received", raw(Ether() / nat_packet))
-                            )
-                        else:  # Layer 3
-                            self.events_sink.put(
-                                (self, "packet-received", raw(nat_packet))
-                            )
+                        # Some NICs re-assemble packets on hardware before delivering them to 
+                        # the kernel network stack. 
+                        # This means that the stack can get packets that are bigger than the 
+                        # link's MTU. For the simulation, we want to ensure packets put into
+                        # simulated links respect the MTU, so we manually fragment them here. 
+                        #
+                        # See Generic Receive Offload (GRO) / Large Receive Offload (LRO)
+                        fragments = fragment(nat_packet, fragsize=self.fragment_size)
+                        for frag in fragments:
+                            if self.layer_2:
+                                self.events_sink.put(
+                                    (self, "packet-received", raw(Ether() / frag))
+                                )
+                            else:  # Layer 3
+                                self.events_sink.put(
+                                    (self, "packet-received", raw(frag))
+                                )
                 else:
                     log.warn(f"[INTERNET TUNNEL] Filtering non-IP packet {packet}")
             self._socket = None
@@ -166,7 +178,7 @@ def get_ip_address(ifname):
 
 
 class NAT:
-    def __init__(self, external_ip, network=ROOT_NETWORK, mask=ROOT_MASK):
+    def __init__(self, external_ip, network, mask):
         self.external_ip = external_ip
         self.icmp_table = {}
         self.transport_nat_table = {}
